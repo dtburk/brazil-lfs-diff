@@ -78,7 +78,7 @@ all_dictionary_file_paths <- list(
         file.path(
           paths$pnad_dict_dir1,
           .x,
-          ifelse(.x < 2011, "dicion rio", "Dicion rio")
+          ifelse(.x %in% c(2001, 2003:2009), "dicion rio", "Dicion rio")
         ),
         full.names = TRUE
       )
@@ -589,59 +589,42 @@ data5$visit_period[data5$visit_period=="annual"] <- "Annual"
 names(data5)
 data5 <- data5 %>% rename("data.years"="dic.years")
 
-# recoding missing values in key variables (identifiers for merge)
-table(data5$series, useNA = "ifany")
-table(microdata_structure_notes$visit_period, useNA = "ifany")
 
-data5 <- data5 %>% mutate(rectype = ifelse(is.na(rectype), 0, rectype))
-microdata_structure_notes <- microdata_structure_notes %>%
-  mutate(rectype = ifelse(is.na(rectype), 0, rectype))
+# Is data5 ready to merge with microdata_structure_notes? ----
+data5 %>%
+  filter(is.na(visit_period)) %>%
+  distinct(series, data.years, rectype) %>%
+  arrange(series, data.years, rectype)
 
-data5 <- data5 %>% mutate(visit_number = ifelse(is.na(visit_number), 0, visit_number))
-microdata_structure_notes <- microdata_structure_notes %>%
-  mutate(visit_number = ifelse(is.na(visit_number), 0, visit_number))
+data5 %>%
+  filter(series == "PNAD") %>%
+  pull(data.years) %>%
+  unique() %>%
+  sort()
 
-data5 <- data5 %>% mutate(visit_period = ifelse(is.na(visit_period), 0, visit_period))
-microdata_structure_notes <- microdata_structure_notes %>%
-  mutate(visit_period = ifelse(is.na(visit_period), 0, visit_period))
+microdata_structure_notes %>%
+  filter(is.na(visit_period))
 
+# Looks like all the PNAD surveys have visit_period "Annual" in
+# microdata_structure_notes -- let's recode to that value in data5
+data5 <- data5 %>%
+  mutate(visit_period = if_else(series == "PNAD", "Annual", visit_period))
 
-# checking if columns have the same structure
-str(data5$data.years)
-str(microdata_structure_notes$data.years)
-data5$data.years <- as.numeric(data5$data.years)
+data6 <- data5 %>%
+  mutate(data.years = as.numeric(data.years)) %>%
+  left_join(
+    microdata_structure_notes,
+    by = c("series", "data.years", "visit_period", "visit_number", "rectype")
+  )
 
-str(data5$visit_number)
-str(microdata_structure_notes$visit_number)
-
-str(data5$visit_period)
-str(microdata_structure_notes$visit_period)
-
-#Recipe Objective
-#In formation of a database, all the data cannot be stored in one table to avoid duplicacy. To extract specific information out of the database, we merge two or more tables using a common field. The merging takes place w.r.t the concept of joins. There are 5 types of joins: ​
-
-#Inner join: Returns only matching records
-#Outer join: Returns all records including no matches in both directions
-#Left Join: Returns all records in left dataframe and only matching records from the other
-#Right Join : Returns all records in right dataframe and only matching records from the other
-#Cross join: Returns all the possible combination of records in both the dataframes
-
-sum(duplicated(data5))
-data5 <- distinct(data5)
-
-data6 <- inner_join(data5, microdata_structure_notes,
-                    by=c("series", "data.years", "rectype", "visit_number",
-                         "visit_period"))
+# data6 has 80,131 rows, which is 27,984 more rows than data5. This is because
+# microdata_structure_notes had an entry for each quarter for the quarterly
+# PNAD-C, and there were 9,328 quarterly PNAD-C rows in data5.
+# 9,328 * 3 == 27,984
+# (multiplied by 3 because we end up with 4 copies of each quarterly PNAD-C row
+# whereas we started out with just 1 copy of each)
 
 
-
-table(data6$data_path, useNA="ifany") #error! returns only the path for PNADC data
-table(microdata_structure_notes$data_path)
-
-sum(duplicated(data6))
-77948-19350
-
-data7 <- distinct(data6)
 #Save files------------------------------------------------------------------
 #write.csv(values_path, "codes_paths_PNADandPNADC.csv")
 #write.csv(ipums_values, "ipums_valuescode_PNADandPNADC.csv")
@@ -653,62 +636,86 @@ data7 <- distinct(data6)
 names(data6)
 
 all_data_files <- data6 %>%
-  distinct(series, dic.years, rectype, visit_number, visit_period)
+  distinct(
+    series, data.years, rectype, visit_number, visit_period, quarter, data_path,
+    dat_name, dat_format
+  )
+# This yields 70 data files, which I think is right
 
+# Check that all data files exist
+all_data_files <- all_data_files %>%
+  mutate(
+    dat_name = str_replace(dat_name, "\\[YYYY\\]", as.character(data.years)),
+    dat_name = str_replace(dat_name, "\\[N\\]", as.character(visit_number)),
+    dat_name = str_replace(dat_name, "\\[0Q\\]", paste0("0", quarter)),
+    data_path = str_remove(data_path, "/[0-9]{4}$"), # remove year from end of path
+    data_path = case_when(
+      # for 2015 PNAD the data files are in the top level folder
+      series == "PNAD" & data.years == "2015" ~ data_path,
+      # all other PNAD
+      series == "PNAD" & data.years != "2015" ~
+        file.path(data_path, data.years, "dados"),
+      # PNAD-C annual
+      series == "PNAD-C" & visit_period == "Annual" ~
+        file.path(data_path, "Annual", paste0("Visita_", visit_number)),
+      # PNAD-C quarterly
+      series == "PNAD-C" & visit_period == "Quarter" ~
+        file.path(data_path, "Quarter")
+    ),
+    file_path = file.path(data_path, dat_name),
+    file_path = str_replace(file_path, "/Volumes", "/pkg"),
+    # replace .TXT with .txt if file doesn't exist
+    file_path = if_else(
+      str_detect(file_path, "TXT$") & !file.exists(file_path),
+      str_replace(file_path, "TXT$", "txt"),
+      file_path
+    ),
+    # replace "dados" with "Dados" if file doesn't exist
+    file_path = if_else(
+      !file.exists(file_path),
+      str_replace(file_path, "dados", "Dados"),
+      file_path
+    ),
+    file_exists = file.exists(file_path)
+  )
 
-data6 <- data6 %>%
-  mutate(data_path = str_remove(data_path, "/[0-9]{4}$")) #number with 4 digits
+all_data_files_exist <- all_data_files %>%
+  pull(file_exists) %>%
+  all()
 
+stopifnot(all_data_files_exist)
 
+all_data_files <- all_data_files %>%
+  select(
+    series, data.years, visit_period, visit_number, quarter, rectype, file_path
+  )
 
-
-for (i in 22:nrow(all_data_files)) {
+for (i in 1:nrow(all_data_files)) {
 
   print(i)
 
+  data_file_info <- all_data_files %>%
+    slice(i)
+
+  data_file_path <- data_file_info$file_path
+
   var_info <- data6 %>%
     inner_join(
-      all_data_files %>% slice(i),
-      by = c("series", "visit_number", "dic.years", "rectype", "visit_period")
+      data_file_info,
+      by = c(
+        "series", "data.years", "visit_period", "visit_number", "quarter",
+        "rectype"
+      ),
       #included visit_period
     ) %>%
     # We added this next line because some DOM files had rectype == "P"
     #filter(str_detect(dat_name, "^DOM")) %>%
     #can delete this once we figure out rectype issue
-    distinct(
-      series, `Código de variável`, `Posição inicial`, Tamanho, data_path,
-      dat_name, dat_format, Decim, dic.years, visit_number, visit_period
-    ) %>%
+    distinct(`Código de variável`, `Posição inicial`, Tamanho, Decim) %>%
     mutate(
       `Posição inicial` = as.numeric(`Posição inicial`),
       Tamanho = as.numeric(str_remove(Tamanho, "\\..+"))
     )
-
-  data_file_path <- var_info %>%
-    distinct(data_path, dic.years, dat_name, dat_format, visit_number,
-             visit_period) %>%
-    mutate(
-      data_path = if_else(
-        dic.years != "2015",
-        file.path(data_path, dic.years, "dados"),
-        data_path # add code for 2015, maybe
-      ),
-      dat_name = str_replace(dat_name, "\\[YYYY\\]", dic.years),
-      dat_name = str_replace(dat_name, "\\[N\\]", as.character(visit_number)),
-      file_path = file.path(data_path, dat_name),
-      file_path = if_else(
-        dat_format =="dat",
-        str_replace(file_path, "TXT$", "DAT"),
-        file_path
-      ),
-      file_path = str_replace(file_path, "/Volumes", "/pkg"),
-      file_path
-    ) %>%
-    pull(file_path)
-
-  if (str_detect(data_file_path, "TXT$") && !file.exists(data_file_path)) {
-    data_file_path <- str_replace(data_file_path, "TXT$", "txt")
-  }
 
   col_positions <- fwf_positions(
     start = var_info$`Posição inicial`,
